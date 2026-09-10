@@ -10,6 +10,7 @@ Output shape per result:
 
 import asyncio
 import random
+import time
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
@@ -22,7 +23,16 @@ from .freshness import Freshness
 from .md import html_to_markdown
 
 # Retry schedule (seconds) before an engine is declared dead for a query.
-RETRY_BACKOFF = (2.0, 5.0, 12.0)
+# Total wait capped at ~7s: 1.0 + 2.5 sleeps plus up to 1.5s jitter each.
+RETRY_BACKOFF = (1.0, 2.5)
+RETRY_JITTER = 1.5
+
+# Cooldown: an engine that fully fails this many queries in a row sits out
+# for COOLDOWN_SECS instead of burning retry budget every time.
+COOLDOWN_FAILS = 2
+COOLDOWN_SECS = 60.0
+_COOLDOWN_UNTIL: dict[str, float] = {}
+_CONSEC_FAILS: dict[str, int] = {}
 
 
 async def agent_search(
@@ -43,6 +53,9 @@ async def agent_search(
         raise ValueError(f"Unknown engines: {names}")
 
     async def run_one(e: Engine) -> tuple[str, list[dict]]:
+        # Cooldown: a repeatedly throttled engine sits this query out.
+        if time.time() < _COOLDOWN_UNTIL.get(e.name, 0):
+            return e.name, []
         # Fresh session per engine: DDG-lite serves degraded bot-check shells
         # on reused connections, so sharing one session poisons results.
         async with AsyncSession() as session:
@@ -82,7 +95,6 @@ async def _run_engine(
     session: AsyncSession,
 ) -> tuple[str, list[dict]]:
     now = datetime.now(timezone.utc).isoformat()
-    last_error: str = ""
     for attempt in range(len(RETRY_BACKOFF) + 1):
         try:
             spec = engine.build_request(query, limit, freshness)
@@ -99,13 +111,17 @@ async def _run_engine(
                 session=session,
             )
             parsed = engine.parse_response(text)[:limit]
-            if parsed or attempt == len(RETRY_BACKOFF):
+            if parsed:
+                _CONSEC_FAILS[engine.name] = 0
                 return engine.name, [_structure(r.as_dict(), now) for r in parsed]
-            last_error = "empty results (soft block?)"
-        except Exception as e:
-            last_error = f"{type(e).__name__}: {str(e)[:100]}"
+        except Exception:
+            pass
         if attempt < len(RETRY_BACKOFF):
-            await asyncio.sleep(RETRY_BACKOFF[attempt] + random.uniform(0, 1.5))
+            await asyncio.sleep(RETRY_BACKOFF[attempt] + random.uniform(0, RETRY_JITTER))
+    # Fully failed: count toward cooldown so throttled engines sit out.
+    _CONSEC_FAILS[engine.name] = _CONSEC_FAILS.get(engine.name, 0) + 1
+    if _CONSEC_FAILS[engine.name] >= COOLDOWN_FAILS:
+        _COOLDOWN_UNTIL[engine.name] = time.time() + COOLDOWN_SECS
     return engine.name, []
 
 
