@@ -38,12 +38,15 @@ async def agent_search(
     if not selected:
         raise ValueError(f"Unknown engines: {names}")
 
-    async with AsyncSession() as session:
-        runs = [
-            _run_engine(e, query, max_results * 2, fresh.engine_param(), timeout, session)
-            for e in selected
-        ]
-        grouped = await asyncio.gather(*runs)
+    async def run_one(e: Engine) -> tuple[str, list[dict]]:
+        # Fresh session per engine: DDG-lite serves degraded bot-check shells
+        # on reused connections, so sharing one session poisons results.
+        async with AsyncSession() as session:
+            return await _run_engine(
+                e, query, max_results * 2, fresh.engine_param(), timeout, session
+            )
+
+    grouped = await asyncio.gather(*(run_one(e) for e in selected))
 
     seen: set[str] = set()
     results: list[dict] = []
