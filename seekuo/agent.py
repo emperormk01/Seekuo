@@ -9,6 +9,7 @@ Output shape per result:
 """
 
 import asyncio
+import random
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
@@ -19,6 +20,9 @@ from .engines import ALL_ENGINES
 from .engines.base import Engine
 from .freshness import Freshness
 from .md import html_to_markdown
+
+# Retry schedule (seconds) before an engine is declared dead for a query.
+RETRY_BACKOFF = (2.0, 5.0, 12.0)
 
 
 async def agent_search(
@@ -78,26 +82,31 @@ async def _run_engine(
     session: AsyncSession,
 ) -> tuple[str, list[dict]]:
     now = datetime.now(timezone.utc).isoformat()
-    try:
-        spec = engine.build_request(query, limit, freshness)
-        specs = spec if isinstance(spec, list) else [spec]
-        s = specs[-1]
-        text = await fetch(
-            s.url,
-            method=s.method,
-            params=s.params or None,
-            data=s.data or None,
-            headers=s.headers or None,
-            cookies=s.cookies or None,
-            timeout=timeout,
-            session=session,
-        )
-        out = []
-        for r in engine.parse_response(text)[:limit]:
-            out.append(_structure(r.as_dict(), now))
-        return engine.name, out
-    except Exception:
-        return engine.name, []
+    last_error: str = ""
+    for attempt in range(len(RETRY_BACKOFF) + 1):
+        try:
+            spec = engine.build_request(query, limit, freshness)
+            specs = spec if isinstance(spec, list) else [spec]
+            s = specs[-1]
+            text = await fetch(
+                s.url,
+                method=s.method,
+                params=s.params or None,
+                data=s.data or None,
+                headers=s.headers or None,
+                cookies=s.cookies or None,
+                timeout=timeout,
+                session=session,
+            )
+            parsed = engine.parse_response(text)[:limit]
+            if parsed or attempt == len(RETRY_BACKOFF):
+                return engine.name, [_structure(r.as_dict(), now) for r in parsed]
+            last_error = "empty results (soft block?)"
+        except Exception as e:
+            last_error = f"{type(e).__name__}: {str(e)[:100]}"
+        if attempt < len(RETRY_BACKOFF):
+            await asyncio.sleep(RETRY_BACKOFF[attempt] + random.uniform(0, 1.5))
+    return engine.name, []
 
 
 def _structure(r: dict, now: str) -> dict:
